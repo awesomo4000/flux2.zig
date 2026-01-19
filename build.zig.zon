@@ -1,0 +1,21 @@
+.{
+    .name = .flux2,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .fingerprint = 0xdcab358e03d3eb10,
+
+    .dependencies = .{
+        // No external dependencies for pure Zig implementation
+        // Optional: add zigimg for PNG support
+        // .zigimg = .{
+        //     .url = "https://github.com/zigimg/zigimg/archive/refs/tags/v0.4.0.tar.gz",
+        //     .hash = "...",
+        // },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

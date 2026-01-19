@@ -1,0 +1,736 @@
+//! hfd - HuggingFace Model Downloader
+//!
+//! A pure Zig tool for downloading models from HuggingFace Hub.
+//! No Python required!
+//!
+//! Usage:
+//!   hfd <repo_id> [-o output_dir] [--include pattern] [--exclude pattern]
+//!
+//! Examples:
+//!   hfd black-forest-labs/FLUX.2-klein
+//!   hfd black-forest-labs/FLUX.2-klein -o ./my-model
+//!   hfd black-forest-labs/FLUX.2-klein --include "*.safetensors"
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var args = try Args.parse(allocator);
+    defer args.deinit();
+
+    if (args.help) {
+        printUsage();
+        return;
+    }
+
+    const repo_id = args.repo_id orelse {
+        std.debug.print("Error: repository ID required\n\n", .{});
+        printUsage();
+        std.process.exit(1);
+    };
+
+    var downloader = try HfDownloader.init(allocator, .{
+        .repo_id = repo_id,
+        .revision = args.revision,
+        .output_dir = args.output_dir orelse blk: {
+            // Default: repo name (after /)
+            if (std.mem.lastIndexOfScalar(u8, repo_id, '/')) |idx| {
+                break :blk repo_id[idx + 1 ..];
+            }
+            break :blk repo_id;
+        },
+        .token = args.token orelse std.posix.getenv("HF_TOKEN"),
+        .include_patterns = args.include_patterns.items,
+        .exclude_patterns = args.exclude_patterns.items,
+        .resume_downloads = args.resume_downloads,
+        .dry_run = args.dry_run,
+        .quiet = args.quiet,
+        .verbose = args.verbose,
+    });
+    defer downloader.deinit();
+
+    downloader.run() catch |err| {
+        std.debug.print("Error: {}\n", .{err});
+        std.process.exit(1);
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HuggingFace Downloader
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const HfDownloader = struct {
+    allocator: Allocator,
+    config: Config,
+    http_client: std.http.Client,
+
+    pub const Config = struct {
+        repo_id: []const u8,
+        revision: []const u8,
+        output_dir: []const u8,
+        token: ?[]const u8,
+        include_patterns: []const []const u8,
+        exclude_patterns: []const []const u8,
+        resume_downloads: bool,
+        dry_run: bool,
+        quiet: bool,
+        verbose: bool,
+    };
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, config: Config) !Self {
+        return Self{
+            .allocator = allocator,
+            .config = config,
+            // Use larger buffers for TLS compatibility (TLS records are up to 16k)
+            .http_client = std.http.Client{
+                .allocator = allocator,
+                .tls_buffer_size = 32 * 1024, // 32k for TLS
+                .read_buffer_size = 32 * 1024, // 32k for reading
+                .write_buffer_size = 8 * 1024, // 8k for writing
+            },
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.http_client.deinit();
+    }
+
+    pub fn run(self: *Self) !void {
+        if (!self.config.quiet) {
+            std.debug.print("Fetching file list for {s}...\n", .{self.config.repo_id});
+        }
+
+        // List files in repository
+        const files = try self.listFiles();
+        defer {
+            for (files) |f| f.deinit(self.allocator);
+            self.allocator.free(files);
+        }
+
+        // Filter files
+        var to_download: std.ArrayList(FileInfo) = .{};
+        defer to_download.deinit(self.allocator);
+
+        var total_size: usize = 0;
+        for (files) |file| {
+            if (self.shouldDownload(file)) {
+                try to_download.append(self.allocator, file);
+                total_size += file.size;
+            }
+        }
+
+        if (!self.config.quiet) {
+            std.debug.print("Found {d} files ({s} total)\n\n", .{
+                to_download.items.len,
+                formatSize(total_size),
+            });
+        }
+
+        if (self.config.dry_run) {
+            std.debug.print("Files to download:\n", .{});
+            for (to_download.items) |file| {
+                std.debug.print("  {s} ({s})\n", .{ file.path, formatSize(file.size) });
+            }
+            return;
+        }
+
+        // Create output directory
+        std.fs.cwd().makePath(self.config.output_dir) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+
+        // Download files
+        var downloaded: usize = 0;
+        var failed: usize = 0;
+
+        for (to_download.items) |file| {
+            self.downloadFile(file) catch |err| {
+                std.debug.print("\nError downloading {s}: {}\n", .{ file.path, err });
+                failed += 1;
+                continue;
+            };
+            downloaded += 1;
+        }
+
+        if (!self.config.quiet) {
+            std.debug.print("\n\nDownload complete: {s}/ ({d} files", .{
+                self.config.output_dir,
+                downloaded,
+            });
+            if (failed > 0) {
+                std.debug.print(", {d} failed", .{failed});
+            }
+            std.debug.print(")\n", .{});
+        }
+    }
+
+    fn listFiles(self: *Self) ![]FileInfo {
+        var result: std.ArrayList(FileInfo) = .{};
+        errdefer {
+            for (result.items) |f| f.deinit(self.allocator);
+            result.deinit(self.allocator);
+        }
+
+        try self.listFilesRecursive(&result, "");
+
+        return result.toOwnedSlice(self.allocator);
+    }
+
+    fn listFilesRecursive(self: *Self, result: *std.ArrayList(FileInfo), prefix: []const u8) !void {
+        const url = try std.fmt.allocPrint(
+            self.allocator,
+            "https://huggingface.co/api/models/{s}/tree/{s}{s}{s}",
+            .{
+                self.config.repo_id,
+                self.config.revision,
+                if (prefix.len > 0) "/" else "",
+                prefix,
+            },
+        );
+        defer self.allocator.free(url);
+
+        const body = try self.httpGet(url);
+        defer self.allocator.free(body);
+
+        var parsed = std.json.parseFromSlice(
+            []const JsonFileEntry,
+            self.allocator,
+            body,
+            .{ .ignore_unknown_fields = true },
+        ) catch |err| {
+            if (self.config.verbose) {
+                std.debug.print("JSON parse error: {}\nBody: {s}\n", .{ err, body });
+            }
+            return err;
+        };
+        defer parsed.deinit();
+
+        for (parsed.value) |entry| {
+            if (std.mem.eql(u8, entry.type, "directory")) {
+                // Recurse into subdirectory
+                try self.listFilesRecursive(result, entry.path);
+            } else if (std.mem.eql(u8, entry.type, "file")) {
+                const sha256: ?[]const u8 = if (entry.lfs) |lfs|
+                    if (lfs.oid) |oid| try self.allocator.dupe(u8, oid) else null
+                else
+                    null;
+                try result.append(self.allocator, FileInfo{
+                    .path = try self.allocator.dupe(u8, entry.path),
+                    .size = entry.size orelse 0,
+                    .is_lfs = entry.lfs != null,
+                    .sha256 = sha256,
+                });
+            }
+        }
+    }
+
+    fn downloadFile(self: *Self, file: FileInfo) !void {
+        const out_path = try std.fs.path.join(self.allocator, &.{
+            self.config.output_dir,
+            file.path,
+        });
+        defer self.allocator.free(out_path);
+
+        // Create parent directories
+        if (std.fs.path.dirname(out_path)) |dir| {
+            std.fs.cwd().makePath(dir) catch |err| {
+                if (err != error.PathAlreadyExists) return err;
+            };
+        }
+
+        // Check if already downloaded
+        if (std.fs.cwd().statFile(out_path)) |stat| {
+            if (stat.size == file.size) {
+                if (!self.config.quiet) {
+                    std.debug.print("{s}: already exists, skipping\n", .{file.path});
+                }
+                return;
+            }
+        } else |_| {}
+
+        // Check for partial download
+        var start_offset: usize = 0;
+        const partial_path = try std.fmt.allocPrint(self.allocator, "{s}.partial", .{out_path});
+        defer self.allocator.free(partial_path);
+
+        if (self.config.resume_downloads) {
+            if (std.fs.cwd().statFile(partial_path)) |stat| {
+                start_offset = stat.size;
+                if (!self.config.quiet) {
+                    std.debug.print("{s}: resuming from {s}\n", .{ file.path, formatSize(start_offset) });
+                }
+            } else |_| {}
+        }
+
+        // Build download URL
+        const url = try std.fmt.allocPrint(
+            self.allocator,
+            "https://huggingface.co/{s}/resolve/{s}/{s}",
+            .{ self.config.repo_id, self.config.revision, file.path },
+        );
+        defer self.allocator.free(url);
+
+        try self.downloadFromUrl(url, out_path, partial_path, start_offset, file.size);
+
+        // Verify SHA256 hash if available
+        if (file.sha256) |expected_hash| {
+            if (self.config.verbose) {
+                std.debug.print("Verifying SHA256...\n", .{});
+            }
+            const actual_hash = try self.computeFileSha256(out_path);
+            if (!std.mem.eql(u8, &actual_hash, expected_hash)) {
+                std.debug.print("WARNING: SHA256 mismatch for {s}\n  expected: {s}\n  actual:   {s}\n", .{
+                    file.path,
+                    expected_hash,
+                    &actual_hash,
+                });
+            } else if (self.config.verbose) {
+                std.debug.print("SHA256 verified: {s}\n", .{&actual_hash});
+            }
+        }
+    }
+
+    fn computeFileSha256(self: *Self, path: []const u8) ![64]u8 {
+        _ = self;
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var buf: [64 * 1024]u8 = undefined;
+        var read_buf: [4096]u8 = undefined;
+        var file_reader = file.reader(&read_buf);
+        const reader = &file_reader.interface;
+
+        while (true) {
+            const n = try reader.readSliceShort(&buf);
+            if (n == 0) break;
+            hasher.update(buf[0..n]);
+        }
+
+        const digest = hasher.finalResult();
+        return std.fmt.bytesToHex(&digest, .lower);
+    }
+
+    fn downloadFromUrl(
+        self: *Self,
+        url: []const u8,
+        final_path: []const u8,
+        partial_path: []const u8,
+        start_offset: usize,
+        total_size: usize,
+    ) !void {
+        // Build extra headers
+        var headers_buf: [512]u8 = undefined;
+        var headers_list: [2]std.http.Header = undefined;
+        var header_count: usize = 0;
+
+        // Auth header
+        if (self.config.token) |token| {
+            const auth_value = std.fmt.bufPrint(headers_buf[0..256], "Bearer {s}", .{token}) catch return error.TokenTooLong;
+            headers_list[header_count] = .{ .name = "Authorization", .value = auth_value };
+            header_count += 1;
+        }
+
+        // Range header for resume
+        if (start_offset > 0) {
+            const range_value = std.fmt.bufPrint(headers_buf[256..], "bytes={d}-", .{start_offset}) catch return error.RangeHeaderTooLong;
+            headers_list[header_count] = .{ .name = "Range", .value = range_value };
+            header_count += 1;
+        }
+
+        // Use request API for streaming downloads
+        const uri = try std.Uri.parse(url);
+        var req = try self.http_client.request(.GET, uri, .{
+            .extra_headers = headers_list[0..header_count],
+        });
+        defer req.deinit();
+
+        try req.sendBodiless();
+
+        var redirect_buf: [4096]u8 = undefined;
+        var response = req.receiveHead(&redirect_buf) catch |err| {
+            if (self.config.verbose) {
+                std.debug.print("Receive error for {s}: {}\n", .{ url, err });
+            }
+            return error.HttpError;
+        };
+
+        if (response.head.status != .ok and response.head.status != .partial_content) {
+            if (self.config.verbose) {
+                std.debug.print("HTTP {d} for {s}\n", .{ @intFromEnum(response.head.status), url });
+            }
+            return error.HttpError;
+        }
+
+        // Get expected body size from response headers (cast u64 to usize for this platform)
+        const expected_size: usize = if (response.head.content_length) |cl|
+            @intCast(cl)
+        else
+            total_size - start_offset;
+
+        // Open output file
+        const use_partial = start_offset > 0 or total_size > 1024 * 1024; // Use .partial for files > 1MB
+        const write_path = if (use_partial) partial_path else final_path;
+
+        const file = try std.fs.cwd().createFile(write_path, .{
+            .truncate = start_offset == 0,
+        });
+        defer file.close();
+
+        if (start_offset > 0) {
+            try file.seekTo(start_offset);
+        }
+
+        // Download with progress - use larger buffer for TLS
+        var buf: [64 * 1024]u8 = undefined;
+        var downloaded = start_offset;
+        var body_read: usize = 0;
+        var last_print = std.time.milliTimestamp();
+
+        var transfer_buf: [32 * 1024]u8 = undefined;
+        var reader = response.reader(&transfer_buf);
+
+        // Read until we've got all expected bytes (avoids reader state bug after EOF)
+        while (body_read < expected_size) {
+            const remaining = expected_size - body_read;
+            const to_read = @min(buf.len, remaining);
+            const n = reader.readSliceShort(buf[0..to_read]) catch |err| {
+                if (self.config.verbose) {
+                    std.debug.print("Read error: {}\n", .{err});
+                }
+                return error.HttpError;
+            };
+            if (n == 0) break;
+
+            try file.writeAll(buf[0..n]);
+            body_read += n;
+            downloaded = start_offset + body_read;
+
+            // Update progress every 100ms
+            const now = std.time.milliTimestamp();
+            if (!self.config.quiet and (now - last_print > 100 or downloaded == total_size)) {
+                self.printProgress(final_path, downloaded, total_size);
+                last_print = now;
+            }
+        }
+
+        // Rename partial to final
+        if (use_partial) {
+            try std.fs.cwd().rename(partial_path, final_path);
+        }
+
+        if (!self.config.quiet) {
+            std.debug.print("\n", .{});
+        }
+    }
+
+    fn printProgress(self: *Self, path: []const u8, downloaded: usize, total: usize) void {
+        _ = self;
+        const basename = std.fs.path.basename(path);
+        const pct: f64 = if (total > 0)
+            @as(f64, @floatFromInt(downloaded)) / @as(f64, @floatFromInt(total)) * 100
+        else
+            0;
+
+        // Progress bar
+        const bar_width = 30;
+        const filled = @as(usize, @intFromFloat(pct / 100.0 * bar_width));
+
+        std.debug.print("\r{s}: {s}/{s} [", .{
+            truncatePath(basename, 30),
+            formatSize(downloaded),
+            formatSize(total),
+        });
+
+        for (0..bar_width) |i| {
+            if (i < filled) {
+                std.debug.print("#", .{});
+            } else {
+                std.debug.print("-", .{});
+            }
+        }
+
+        std.debug.print("] {d:.1}%   ", .{pct});
+    }
+
+    fn httpGet(self: *Self, url: []const u8) ![]u8 {
+        // Build extra headers for auth
+        var auth_header_buf: [256]u8 = undefined;
+        const extra_headers: []const std.http.Header = if (self.config.token) |token| blk: {
+            const auth_value = std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{token}) catch return error.TokenTooLong;
+            break :blk &.{.{ .name = "Authorization", .value = auth_value }};
+        } else &.{};
+
+        // Use request API for proper body reading
+        const uri = try std.Uri.parse(url);
+        var req = try self.http_client.request(.GET, uri, .{
+            .extra_headers = extra_headers,
+        });
+        defer req.deinit();
+
+        try req.sendBodiless();
+
+        var redirect_buf: [4096]u8 = undefined;
+        var response = req.receiveHead(&redirect_buf) catch |err| {
+            if (self.config.verbose) {
+                std.debug.print("Receive error for {s}: {}\n", .{ url, err });
+            }
+            return error.HttpError;
+        };
+
+        if (response.head.status != .ok) {
+            if (self.config.verbose) {
+                std.debug.print("HTTP {d} for {s}\n", .{ @intFromEnum(response.head.status), url });
+            }
+            return error.HttpError;
+        }
+
+        // Read body using allocRemaining with larger buffer for TLS
+        var transfer_buf: [32 * 1024]u8 = undefined;
+        var reader = response.reader(&transfer_buf);
+        const body = reader.allocRemaining(self.allocator, std.Io.Limit.limited(10 * 1024 * 1024)) catch |err| {
+            if (self.config.verbose) {
+                std.debug.print("Read error: {}\n", .{err});
+            }
+            return error.HttpError;
+        };
+
+        return body;
+    }
+
+    fn shouldDownload(self: *Self, file: FileInfo) bool {
+        // Check excludes first
+        for (self.config.exclude_patterns) |pattern| {
+            if (matchGlob(file.path, pattern)) return false;
+        }
+
+        // If no includes specified, download all
+        if (self.config.include_patterns.len == 0) return true;
+
+        // Check includes
+        for (self.config.include_patterns) |pattern| {
+            if (matchGlob(file.path, pattern)) return true;
+        }
+
+        return false;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// File Info
+// ─────────────────────────────────────────────────────────────────────────────
+
+const FileInfo = struct {
+    path: []const u8,
+    size: usize,
+    is_lfs: bool,
+    sha256: ?[]const u8, // SHA256 hash for LFS files (hex string)
+
+    fn deinit(self: FileInfo, allocator: Allocator) void {
+        allocator.free(self.path);
+        if (self.sha256) |h| allocator.free(h);
+    }
+};
+
+const JsonFileEntry = struct {
+    type: []const u8,
+    path: []const u8,
+    size: ?usize = null,
+    lfs: ?JsonLfsInfo = null,
+};
+
+const JsonLfsInfo = struct {
+    oid: ?[]const u8 = null, // SHA256 hash (called 'oid' in HF API)
+    size: ?usize = null,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Argument Parsing
+// ─────────────────────────────────────────────────────────────────────────────
+
+const Args = struct {
+    allocator: Allocator,
+    repo_id: ?[]const u8 = null,
+    output_dir: ?[]const u8 = null,
+    revision: []const u8 = "main",
+    token: ?[]const u8 = null,
+    include_patterns: std.ArrayList([]const u8),
+    exclude_patterns: std.ArrayList([]const u8),
+    resume_downloads: bool = false,
+    dry_run: bool = false,
+    quiet: bool = false,
+    verbose: bool = false,
+    help: bool = false,
+
+    fn parse(allocator: Allocator) !Args {
+        var self = Args{
+            .allocator = allocator,
+            .include_patterns = .{},
+            .exclude_patterns = .{},
+        };
+        errdefer self.deinit();
+
+        var args_iter = try std.process.argsWithAllocator(allocator);
+        defer args_iter.deinit();
+
+        _ = args_iter.skip(); // program name
+
+        while (args_iter.next()) |arg| {
+            if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+                self.help = true;
+            } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+                self.output_dir = args_iter.next();
+            } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--revision")) {
+                self.revision = args_iter.next() orelse "main";
+            } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--token")) {
+                self.token = args_iter.next();
+            } else if (std.mem.eql(u8, arg, "--include")) {
+                if (args_iter.next()) |pattern| {
+                    try self.include_patterns.append(allocator, pattern);
+                }
+            } else if (std.mem.eql(u8, arg, "--exclude")) {
+                if (args_iter.next()) |pattern| {
+                    try self.exclude_patterns.append(allocator, pattern);
+                }
+            } else if (std.mem.eql(u8, arg, "--resume")) {
+                self.resume_downloads = true;
+            } else if (std.mem.eql(u8, arg, "--dry-run")) {
+                self.dry_run = true;
+            } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
+                self.quiet = true;
+            } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+                self.verbose = true;
+            } else if (!std.mem.startsWith(u8, arg, "-")) {
+                self.repo_id = arg;
+            }
+        }
+
+        return self;
+    }
+
+    fn deinit(self: *Args) void {
+        self.include_patterns.deinit(self.allocator);
+        self.exclude_patterns.deinit(self.allocator);
+    }
+};
+
+fn printUsage() void {
+    const usage =
+        \\hfd - HuggingFace Model Downloader
+        \\
+        \\A pure Zig tool for downloading models from HuggingFace Hub.
+        \\
+        \\USAGE:
+        \\    hfd <repo_id> [options]
+        \\
+        \\ARGUMENTS:
+        \\    <repo_id>             Repository ID (e.g., black-forest-labs/FLUX.2-klein)
+        \\
+        \\OPTIONS:
+        \\    -o, --output DIR      Output directory (default: repo name)
+        \\    -r, --revision REV    Git revision/branch (default: main)
+        \\    -t, --token TOKEN     HuggingFace token (or set HF_TOKEN env var)
+        \\    --include PATTERN     Only download files matching glob pattern
+        \\    --exclude PATTERN     Skip files matching glob pattern
+        \\    --resume              Resume interrupted downloads
+        \\    --dry-run             Show files without downloading
+        \\    -q, --quiet           Suppress progress output
+        \\    -v, --verbose         Show detailed output
+        \\    -h, --help            Show this help
+        \\
+        \\EXAMPLES:
+        \\    hfd black-forest-labs/FLUX.2-klein
+        \\    hfd black-forest-labs/FLUX.2-klein -o ./my-model
+        \\    hfd black-forest-labs/FLUX.2-klein --include "*.safetensors"
+        \\    hfd black-forest-labs/FLUX.2-klein --exclude "*.bin" --exclude "*.onnx"
+        \\
+        \\ENVIRONMENT:
+        \\    HF_TOKEN              HuggingFace API token for gated models
+        \\
+    ;
+    std.debug.print("{s}", .{usage});
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utilities
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Simple glob matching (* and ?)
+fn matchGlob(text: []const u8, pattern: []const u8) bool {
+    var ti: usize = 0;
+    var pi: usize = 0;
+    var star_ti: ?usize = null;
+    var star_pi: ?usize = null;
+
+    while (ti < text.len) {
+        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti])) {
+            ti += 1;
+            pi += 1;
+        } else if (pi < pattern.len and pattern[pi] == '*') {
+            star_ti = ti;
+            star_pi = pi;
+            pi += 1;
+        } else if (star_pi) |sp| {
+            pi = sp + 1;
+            star_ti.? += 1;
+            ti = star_ti.?;
+        } else {
+            return false;
+        }
+    }
+
+    while (pi < pattern.len and pattern[pi] == '*') {
+        pi += 1;
+    }
+
+    return pi == pattern.len;
+}
+
+fn formatSize(bytes: usize) []const u8 {
+    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB" };
+    var size: f64 = @floatFromInt(bytes);
+    var unit_idx: usize = 0;
+
+    while (size >= 1024 and unit_idx < units.len - 1) {
+        size /= 1024;
+        unit_idx += 1;
+    }
+
+    // Return static buffer (not ideal but works for display)
+    const Static = struct {
+        var buf: [32]u8 = undefined;
+    };
+
+    return std.fmt.bufPrint(&Static.buf, "{d:.1} {s}", .{ size, units[unit_idx] }) catch return "???";
+}
+
+fn truncatePath(path: []const u8, max_len: usize) []const u8 {
+    if (path.len <= max_len) return path;
+    return path[0..max_len];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+test "glob matching" {
+    try std.testing.expect(matchGlob("model.safetensors", "*.safetensors"));
+    try std.testing.expect(matchGlob("vae/model.safetensors", "*.safetensors"));
+    try std.testing.expect(!matchGlob("model.bin", "*.safetensors"));
+    try std.testing.expect(matchGlob("config.json", "config.*"));
+    try std.testing.expect(matchGlob("anything", "*"));
+    try std.testing.expect(matchGlob("test", "t?st"));
+    try std.testing.expect(!matchGlob("test", "t?t"));
+}
+
+test "format size" {
+    try std.testing.expectEqualStrings("0.0 B", formatSize(0));
+    try std.testing.expectEqualStrings("1.0 KB", formatSize(1024));
+    try std.testing.expectEqualStrings("1.0 MB", formatSize(1024 * 1024));
+}
