@@ -13,6 +13,25 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const progress = @import("progress.zig");
+
+/// Format bytes into human-readable size using caller-provided buffer
+fn formatSizeLocal(bytes: usize, buf: []u8) []const u8 {
+    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB" };
+    var size: f64 = @floatFromInt(bytes);
+    var unit_idx: usize = 0;
+
+    while (size >= 1024 and unit_idx < units.len - 1) {
+        size /= 1024;
+        unit_idx += 1;
+    }
+
+    if (unit_idx == 0) {
+        return std.fmt.bufPrint(buf, "{d} {s}", .{ bytes, units[0] }) catch "?";
+    } else {
+        return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ size, units[unit_idx] }) catch "?";
+    }
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -79,6 +98,9 @@ pub const HfDownloader = struct {
         dry_run: bool,
         quiet: bool,
         verbose: bool,
+        // Parallel download settings
+        parallel_chunks: usize = 4, // Number of parallel chunks per file
+        parallel_threshold: usize = 5 * 1024 * 1024, // Min file size for parallel (5MB)
     };
 
     const Self = @This();
@@ -276,7 +298,19 @@ pub const HfDownloader = struct {
         );
         defer self.allocator.free(url);
 
-        try self.downloadFromUrl(url, out_path, partial_path, start_offset, file.size);
+        // Use parallel download for large files (no resume support for parallel yet)
+        const use_parallel = file.size >= self.config.parallel_threshold and
+            start_offset == 0 and
+            self.config.parallel_chunks > 1;
+
+        if (use_parallel) {
+            if (self.config.verbose) {
+                std.debug.print("{s}: using {d} parallel chunks\n", .{ file.path, self.config.parallel_chunks });
+            }
+            try self.downloadParallel(url, out_path, file.size, self.config.parallel_chunks);
+        } else {
+            try self.downloadFromUrl(url, out_path, partial_path, start_offset, file.size);
+        }
 
         // Verify SHA256 hash if available
         if (file.sha256) |expected_hash| {
@@ -438,25 +472,255 @@ pub const HfDownloader = struct {
         else
             0;
 
-        // Progress bar
-        const bar_width = 30;
-        const filled = @as(usize, @intFromFloat(pct / 100.0 * bar_width));
+        // Format sizes into separate buffers
+        var tot_buf: [32]u8 = undefined;
+        const tot_str = formatSizeLocal(total, &tot_buf);
 
-        std.debug.print("\r{s}: {s}/{s} [", .{
-            truncatePath(basename, 30),
-            formatSize(downloaded),
-            formatSize(total),
-        });
+        // Format current with same width as total for stable display
+        var dl_buf: [32]u8 = undefined;
+        const dl_raw = formatSizeLocal(downloaded, &dl_buf);
+        var dl_padded: [32]u8 = undefined;
+        const pad_len = if (tot_str.len > dl_raw.len) tot_str.len - dl_raw.len else 0;
+        for (0..pad_len) |i| dl_padded[i] = ' ';
+        @memcpy(dl_padded[pad_len..][0..dl_raw.len], dl_raw);
+        const dl_str = dl_padded[0 .. pad_len + dl_raw.len];
 
-        for (0..bar_width) |i| {
-            if (i < filled) {
-                std.debug.print("#", .{});
-            } else {
-                std.debug.print("-", .{});
+        // Progress bar with fancy chars (yellow filled, gray empty)
+        const bar_width = 24;
+        const filled = @as(usize, @intFromFloat(pct / 100.0 * @as(f64, @floatFromInt(bar_width))));
+
+        std.debug.print("\r\x1b[K{s}: \x1b[33m", .{truncatePath(basename, 25)});
+
+        for (0..filled) |_| std.debug.print("█", .{});
+        std.debug.print("\x1b[90m", .{});
+        for (0..bar_width - filled) |_| std.debug.print("░", .{});
+
+        std.debug.print("\x1b[0m [ {s} / {s} ]", .{ dl_str, tot_str });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Parallel Download Support
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const ChunkResult = struct {
+        success: bool,
+        bytes_written: usize,
+        err_msg: ?[]const u8,
+    };
+
+    const ChunkContext = struct {
+        allocator: Allocator,
+        url: []const u8,
+        file_path: []const u8,
+        start_byte: usize,
+        end_byte: usize,
+        chunk_idx: usize,
+        chunk_size: usize,
+        token: ?[]const u8,
+        result: ChunkResult,
+        progress_bytes: *std.atomic.Value(usize), // Per-chunk progress
+    };
+
+    fn downloadParallel(
+        self: *Self,
+        url: []const u8,
+        final_path: []const u8,
+        total_size: usize,
+        num_chunks: usize,
+    ) !void {
+        const chunk_size = total_size / num_chunks;
+        var threads: [16]?std.Thread = .{null} ** 16;
+        var contexts: [16]ChunkContext = undefined;
+        // Per-thread progress counters
+        var chunk_progress: [16]std.atomic.Value(usize) = undefined;
+        for (0..16) |i| chunk_progress[i] = std.atomic.Value(usize).init(0);
+
+        // Create file and pre-allocate
+        const file = try std.fs.cwd().createFile(final_path, .{ .truncate = true });
+        file.close();
+
+        // Spawn download threads
+        const actual_chunks = @min(num_chunks, 16);
+        for (0..actual_chunks) |i| {
+            const start = i * chunk_size;
+            const end = if (i == actual_chunks - 1) total_size - 1 else (i + 1) * chunk_size - 1;
+            const this_chunk_size = end - start + 1;
+
+            contexts[i] = .{
+                .allocator = self.allocator,
+                .url = url,
+                .file_path = final_path,
+                .start_byte = start,
+                .end_byte = end,
+                .chunk_idx = i,
+                .chunk_size = this_chunk_size,
+                .token = self.config.token,
+                .result = .{ .success = false, .bytes_written = 0, .err_msg = null },
+                .progress_bytes = &chunk_progress[i],
+            };
+
+            threads[i] = try std.Thread.spawn(.{}, downloadChunkThread, .{&contexts[i]});
+        }
+
+        // Progress display loop
+        const start_time = std.time.milliTimestamp();
+        const bar_width: usize = 24;
+        const segment_width = bar_width / actual_chunks;
+
+        while (true) {
+            // Calculate total and per-thread progress
+            var total_downloaded: usize = 0;
+            for (0..actual_chunks) |i| {
+                total_downloaded += chunk_progress[i].load(.monotonic);
+            }
+
+            const pct = if (total_size > 0) (total_downloaded * 100) / total_size else 0;
+            const elapsed_ms = std.time.milliTimestamp() - start_time;
+            const speed = if (elapsed_ms > 0) @as(f64, @floatFromInt(total_downloaded)) / (@as(f64, @floatFromInt(elapsed_ms)) / 1000.0) else 0;
+
+            // Format sizes - compact: "24.0 / 577.2 MB"
+            const total_mb = @as(f64, @floatFromInt(total_size)) / (1024.0 * 1024.0);
+            const current_mb = @as(f64, @floatFromInt(total_downloaded)) / (1024.0 * 1024.0);
+            const speed_mbs = speed / (1024.0 * 1024.0);
+
+            // Build segmented progress bar showing each thread
+            std.debug.print("\r\x1b[K{s}: ", .{std.fs.path.basename(final_path)});
+
+            for (0..actual_chunks) |i| {
+                const chunk_bytes = chunk_progress[i].load(.monotonic);
+                const chunk_total = contexts[i].chunk_size;
+                const chunk_pct = if (chunk_total > 0) (chunk_bytes * 100) / chunk_total else 0;
+                const filled = (chunk_pct * segment_width) / 100;
+
+                // Each thread gets a different color
+                const colors = [_][]const u8{ "\x1b[33m", "\x1b[36m", "\x1b[35m", "\x1b[32m" }; // yellow, cyan, magenta, green
+                std.debug.print("{s}", .{colors[i % 4]});
+                for (0..filled) |_| std.debug.print("█", .{});
+                std.debug.print("\x1b[90m", .{});
+                for (0..segment_width - filled) |_| std.debug.print("░", .{});
+            }
+
+            std.debug.print("\x1b[0m {d:>5.1}/{d:.1} MB {d:>2}% {d:.1} MB/s", .{ current_mb, total_mb, pct, speed_mbs });
+
+            if (total_downloaded >= total_size) break;
+
+            // Check if all threads done
+            var all_done = true;
+            for (0..actual_chunks) |i| {
+                if (threads[i] != null) {
+                    all_done = false;
+                    break;
+                }
+            }
+            if (all_done) break;
+
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+
+        // Wait for all threads
+        var total_written: usize = 0;
+        var had_error = false;
+        for (0..actual_chunks) |i| {
+            if (threads[i]) |t| {
+                t.join();
+                threads[i] = null;
+                total_written += contexts[i].result.bytes_written;
+                if (!contexts[i].result.success) had_error = true;
             }
         }
 
-        std.debug.print("] {d:.1}%   ", .{pct});
+        const final_mb = @as(f64, @floatFromInt(total_written)) / (1024.0 * 1024.0);
+        std.debug.print("\r\x1b[K{s}: \x1b[32m✓\x1b[0m {d:.1} MB\n", .{
+            std.fs.path.basename(final_path),
+            final_mb,
+        });
+
+        if (had_error) {
+            return error.ChunkDownloadFailed;
+        }
+    }
+
+    fn downloadChunkThread(ctx: *ChunkContext) void {
+        downloadChunk(ctx) catch |err| {
+            ctx.result.success = false;
+            ctx.result.err_msg = @errorName(err);
+        };
+    }
+
+    fn downloadChunk(ctx: *ChunkContext) !void {
+        // Each thread needs its own HTTP client
+        var client = std.http.Client{
+            .allocator = ctx.allocator,
+            .tls_buffer_size = 32 * 1024,
+            .read_buffer_size = 32 * 1024,
+            .write_buffer_size = 8 * 1024,
+        };
+        defer client.deinit();
+
+        // Build headers with Range
+        var headers_buf: [512]u8 = undefined;
+        var headers_list: [2]std.http.Header = undefined;
+        var header_count: usize = 0;
+
+        // Auth header
+        if (ctx.token) |token| {
+            const auth_value = std.fmt.bufPrint(headers_buf[0..256], "Bearer {s}", .{token}) catch return error.TokenTooLong;
+            headers_list[header_count] = .{ .name = "Authorization", .value = auth_value };
+            header_count += 1;
+        }
+
+        // Range header
+        const range_value = std.fmt.bufPrint(headers_buf[256..], "bytes={d}-{d}", .{ ctx.start_byte, ctx.end_byte }) catch return error.RangeHeaderTooLong;
+        headers_list[header_count] = .{ .name = "Range", .value = range_value };
+        header_count += 1;
+
+        // Make request
+        const uri = try std.Uri.parse(ctx.url);
+        var req = try client.request(.GET, uri, .{
+            .extra_headers = headers_list[0..header_count],
+        });
+        defer req.deinit();
+
+        try req.sendBodiless();
+
+        var redirect_buf: [4096]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buf);
+
+        if (response.head.status != .ok and response.head.status != .partial_content) {
+            return error.HttpError;
+        }
+
+        // Open file and seek to our chunk position
+        const file = try std.fs.cwd().openFile(ctx.file_path, .{ .mode = .write_only });
+        defer file.close();
+        try file.seekTo(ctx.start_byte);
+
+        // Download our chunk
+        var buf: [64 * 1024]u8 = undefined;
+        var transfer_buf: [32 * 1024]u8 = undefined;
+        var reader = response.reader(&transfer_buf);
+
+        const expected_size = ctx.end_byte - ctx.start_byte + 1;
+        var bytes_read: usize = 0;
+
+        while (bytes_read < expected_size) {
+            const remaining = expected_size - bytes_read;
+            const to_read = @min(buf.len, remaining);
+            const n = reader.readSliceShort(buf[0..to_read]) catch |err| {
+                ctx.result.err_msg = @errorName(err);
+                return err;
+            };
+            if (n == 0) break;
+
+            try file.writeAll(buf[0..n]);
+            bytes_read += n;
+            ctx.result.bytes_written = bytes_read;
+
+            // Update shared progress counter
+            _ = ctx.progress_bytes.fetchAdd(n, .monotonic);
+        }
+
+        ctx.result.success = true;
     }
 
     fn httpGet(self: *Self, url: []const u8) ![]u8 {
