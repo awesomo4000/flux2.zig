@@ -1,0 +1,7 @@
+x/
+.zig-cache/
+zig-out/
+docs/
+CLAUDE.md
+
+
