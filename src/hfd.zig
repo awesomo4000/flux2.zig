@@ -1,7 +1,7 @@
-//! hfd - HuggingFace Model Downloader
+//! hfd - HuggingFace Downloader 🤗
 //!
-//! A pure Zig tool for downloading models from HuggingFace Hub.
-//! No Python required!
+//! Download models from HuggingFace Hub.
+//! Watch out for facehuggers. 👽
 //!
 //! Usage:
 //!   hfd <repo_id> [-o output_dir] [--include pattern] [--exclude pattern]
@@ -270,7 +270,10 @@ pub const HfDownloader = struct {
         if (std.fs.cwd().statFile(out_path)) |stat| {
             if (stat.size == file.size) {
                 if (!self.config.quiet) {
-                    std.debug.print("{s}: already exists, skipping\n", .{file.path});
+                    const skip_name = truncatePath(std.fs.path.basename(file.path), NAME_WIDTH);
+                    std.debug.print("{s}", .{skip_name});
+                    for (0..NAME_WIDTH - @min(skip_name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
+                    std.debug.print(" \x1b[90m- skip\x1b[0m\n", .{});
                 }
                 return;
             }
@@ -459,10 +462,17 @@ pub const HfDownloader = struct {
             try std.fs.cwd().rename(partial_path, final_path);
         }
 
+        // Final progress - show completion
         if (!self.config.quiet) {
-            std.debug.print("\n", .{});
+            var size_buf: [32]u8 = undefined;
+            const name = truncatePath(std.fs.path.basename(final_path), NAME_WIDTH);
+            std.debug.print("\r\x1b[K{s}", .{name});
+            for (0..NAME_WIDTH - @min(name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
+            std.debug.print(" \x1b[32m✓\x1b[0m {s}\n", .{formatSizeLocal(total_size, &size_buf)});
         }
     }
+
+    const NAME_WIDTH = 25; // Fixed width for filename column
 
     fn printProgress(self: *Self, path: []const u8, downloaded: usize, total: usize) void {
         _ = self;
@@ -489,7 +499,12 @@ pub const HfDownloader = struct {
         const bar_width = 24;
         const filled = @as(usize, @intFromFloat(pct / 100.0 * @as(f64, @floatFromInt(bar_width))));
 
-        std.debug.print("\r\x1b[K{s}: \x1b[33m", .{truncatePath(basename, 25)});
+        // Pad filename to fixed width
+        const name = truncatePath(basename, NAME_WIDTH);
+        std.debug.print("\r\x1b[K{s}", .{name});
+        // Pad with spaces if needed
+        for (0..NAME_WIDTH - @min(name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
+        std.debug.print(" \x1b[33m", .{});
 
         for (0..filled) |_| std.debug.print("█", .{});
         std.debug.print("\x1b[90m", .{});
@@ -583,22 +598,43 @@ pub const HfDownloader = struct {
             const current_mb = @as(f64, @floatFromInt(total_downloaded)) / (1024.0 * 1024.0);
             const speed_mbs = speed / (1024.0 * 1024.0);
 
-            // Build segmented progress bar showing each thread
-            std.debug.print("\r\x1b[K{s}: ", .{std.fs.path.basename(final_path)});
+            // Build half-height progress bar: top=threads (fg), bottom=total (bg)
+            // Using ▀ with foreground=top color, background=bottom color
+            const name = truncatePath(std.fs.path.basename(final_path), NAME_WIDTH);
+            std.debug.print("\r\x1b[K{s}", .{name});
+            for (0..NAME_WIDTH - @min(name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
+            std.debug.print(" ", .{});
 
-            for (0..actual_chunks) |i| {
-                const chunk_bytes = chunk_progress[i].load(.monotonic);
-                const chunk_total = contexts[i].chunk_size;
+            const total_filled = (pct * bar_width) / 100;
+
+            // Foreground colors for threads (bright)
+            const fg_colors = [_][]const u8{ "\x1b[93m", "\x1b[96m", "\x1b[95m", "\x1b[92m" }; // bright yellow, cyan, magenta, green
+            const fg_empty = "\x1b[90m"; // gray
+            // Background colors
+            const bg_white = "\x1b[47m"; // white background for total progress
+            const bg_dark = "\x1b[100m"; // dark gray background for empty
+
+            for (0..actual_chunks) |chunk_i| {
+                const chunk_bytes = chunk_progress[chunk_i].load(.monotonic);
+                const chunk_total = contexts[chunk_i].chunk_size;
                 const chunk_pct = if (chunk_total > 0) (chunk_bytes * 100) / chunk_total else 0;
-                const filled = (chunk_pct * segment_width) / 100;
+                const thread_filled = (chunk_pct * segment_width) / 100;
+                const segment_start = chunk_i * segment_width;
 
-                // Each thread gets a different color
-                const colors = [_][]const u8{ "\x1b[33m", "\x1b[36m", "\x1b[35m", "\x1b[32m" }; // yellow, cyan, magenta, green
-                std.debug.print("{s}", .{colors[i % 4]});
-                for (0..filled) |_| std.debug.print("█", .{});
-                std.debug.print("\x1b[90m", .{});
-                for (0..segment_width - filled) |_| std.debug.print("░", .{});
+                for (0..segment_width) |pos| {
+                    const global_pos = segment_start + pos;
+                    const has_thread = pos < thread_filled;
+                    const has_total = global_pos < total_filled;
+
+                    // Set foreground (top half) based on thread progress
+                    const fg = if (has_thread) fg_colors[chunk_i % 4] else fg_empty;
+                    // Set background (bottom half) based on total progress
+                    const bg = if (has_total) bg_white else bg_dark;
+
+                    std.debug.print("{s}{s}▀", .{ fg, bg });
+                }
             }
+            std.debug.print("\x1b[0m", .{}); // reset colors
 
             std.debug.print("\x1b[0m {d:>5.1}/{d:.1} MB {d:>2}% {d:.1} MB/s", .{ current_mb, total_mb, pct, speed_mbs });
 
@@ -629,11 +665,11 @@ pub const HfDownloader = struct {
             }
         }
 
-        const final_mb = @as(f64, @floatFromInt(total_written)) / (1024.0 * 1024.0);
-        std.debug.print("\r\x1b[K{s}: \x1b[32m✓\x1b[0m {d:.1} MB\n", .{
-            std.fs.path.basename(final_path),
-            final_mb,
-        });
+        var size_buf: [32]u8 = undefined;
+        const final_name = truncatePath(std.fs.path.basename(final_path), NAME_WIDTH);
+        std.debug.print("\r\x1b[K{s}", .{final_name});
+        for (0..NAME_WIDTH - @min(final_name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
+        std.debug.print(" \x1b[32m✓\x1b[0m {s}\n", .{formatSizeLocal(total_written, &size_buf)});
 
         if (had_error) {
             return error.ChunkDownloadFailed;
@@ -886,9 +922,10 @@ const Args = struct {
 
 fn printUsage() void {
     const usage =
-        \\hfd - HuggingFace Model Downloader
+        \\hfd - HuggingFace Downloader
         \\
-        \\A pure Zig tool for downloading models from HuggingFace Hub.
+        \\Download models from HuggingFace Hub.
+        \\Watch out for facehuggers.
         \\
         \\USAGE:
         \\    hfd <repo_id> [options]
