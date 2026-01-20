@@ -270,15 +270,15 @@ pub const SafeTensors = struct {
 
     /// List all tensor names
     pub fn listTensors(self: *const Self, allocator: Allocator) ![][]const u8 {
-        var names = std.ArrayList([]const u8).init(allocator);
-        errdefer names.deinit();
+        var names: std.ArrayList([]const u8) = .{};
+        errdefer names.deinit(allocator);
 
         var it = self.tensors.keyIterator();
         while (it.next()) |key| {
-            try names.append(key.*);
+            try names.append(allocator, key.*);
         }
 
-        return names.toOwnedSlice();
+        return names.toOwnedSlice(allocator);
     }
 
     /// Check if a tensor exists

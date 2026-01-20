@@ -162,4 +162,88 @@ pub fn build(b: *std.Build) void {
         .root_module = hfd_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(hfd_tests).step);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test VAE loader
+    // ─────────────────────────────────────────────────────────────────────────
+    const test_vae_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_vae.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const test_vae = b.addExecutable(.{
+        .name = "test-vae",
+        .root_module = test_vae_mod,
+    });
+    b.installArtifact(test_vae);
+
+    const test_vae_cmd = b.addRunArtifact(test_vae);
+    test_vae_cmd.step.dependOn(b.getInstallStep());
+
+    const test_vae_step = b.step("test-vae", "Test VAE safetensors loading");
+    test_vae_step.dependOn(&test_vae_cmd.step);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test VAE decoder
+    // ─────────────────────────────────────────────────────────────────────────
+    const test_vae_decode_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_vae_decode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const test_vae_decode = b.addExecutable(.{
+        .name = "test-vae-decode",
+        .root_module = test_vae_decode_mod,
+    });
+    b.installArtifact(test_vae_decode);
+
+    const test_vae_decode_cmd = b.addRunArtifact(test_vae_decode);
+    test_vae_decode_cmd.step.dependOn(b.getInstallStep());
+
+    const test_vae_decode_step = b.step("test-vae-decode", "Test VAE decoder");
+    test_vae_decode_step.dependOn(&test_vae_decode_cmd.step);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test safetensors loading with FLUX model
+    // ─────────────────────────────────────────────────────────────────────────
+    const test_st_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_safetensors.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const test_st = b.addExecutable(.{
+        .name = "test-safetensors",
+        .root_module = test_st_mod,
+    });
+    b.installArtifact(test_st);
+
+    const test_st_cmd = b.addRunArtifact(test_st);
+    test_st_cmd.step.dependOn(b.getInstallStep());
+
+    const test_st_step = b.step("test-safetensors", "Test safetensors loading with FLUX model");
+    test_st_step.dependOn(&test_st_cmd.step);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test transformer loading
+    // ─────────────────────────────────────────────────────────────────────────
+    const test_tf_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_transformer_load.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const test_tf = b.addExecutable(.{
+        .name = "test-transformer",
+        .root_module = test_tf_mod,
+    });
+    b.installArtifact(test_tf);
+
+    const test_tf_cmd = b.addRunArtifact(test_tf);
+    test_tf_cmd.step.dependOn(b.getInstallStep());
+
+    const test_tf_step = b.step("test-transformer", "Test transformer loading");
+    test_tf_step.dependOn(&test_tf_cmd.step);
 }

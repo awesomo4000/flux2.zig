@@ -413,6 +413,266 @@ fn tanhVec(x: Vec) Vec {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Linear (Matrix Multiply) without bias
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Linear layer without bias: out = x @ W^T
+/// x: [batch, in_features]
+/// weight: [out_features, in_features]
+/// out: [batch, out_features]
+pub fn linearNoBias(out: []f32, x: []const f32, weight: []const f32, batch: usize, in_features: usize, out_features: usize) void {
+    // out = x @ W^T is equivalent to matmul(x, W^T)
+    // But W is [out, in], so we do out[b, o] = sum_i x[b, i] * W[o, i]
+    for (0..batch) |b| {
+        for (0..out_features) |o| {
+            var sum: f32 = 0;
+            for (0..in_features) |i| {
+                sum += x[b * in_features + i] * weight[o * in_features + i];
+            }
+            out[b * out_features + o] = sum;
+        }
+    }
+}
+
+/// Elementwise multiply-accumulate: out += scale_vec * x (per-row scale)
+pub fn addScaled(out: []f32, x: []const f32, scale_vec: []const f32, seq: usize, hidden: usize) void {
+    for (0..seq) |s| {
+        for (0..hidden) |h| {
+            const idx = s * hidden + h;
+            out[idx] += scale_vec[h] * x[idx];
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Convolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 2D convolution: out = conv2d(input, weight) + bias
+/// input: [batch, in_ch, H, W]
+/// weight: [out_ch, in_ch, kH, kW]
+/// bias: [out_ch] or null
+/// out: [batch, out_ch, out_H, out_W]
+pub fn conv2d(
+    out: []f32,
+    input: []const f32,
+    weight: []const f32,
+    bias: ?[]const f32,
+    batch: usize,
+    in_ch: usize,
+    out_ch: usize,
+    H: usize,
+    W: usize,
+    kH: usize,
+    kW: usize,
+    stride: usize,
+    padding: usize,
+) void {
+    const out_H = (H + 2 * padding - kH) / stride + 1;
+    const out_W = (W + 2 * padding - kW) / stride + 1;
+
+    for (0..batch) |b| {
+        for (0..out_ch) |oc| {
+            const bias_val = if (bias) |bb| bb[oc] else 0.0;
+
+            for (0..out_H) |oh| {
+                for (0..out_W) |ow| {
+                    var sum: f32 = bias_val;
+
+                    for (0..in_ch) |ic| {
+                        for (0..kH) |kh| {
+                            for (0..kW) |kw| {
+                                const ih_raw = oh * stride + kh;
+                                const iw_raw = ow * stride + kw;
+
+                                // Handle padding
+                                if (ih_raw >= padding and ih_raw < H + padding and
+                                    iw_raw >= padding and iw_raw < W + padding)
+                                {
+                                    const ih = ih_raw - padding;
+                                    const iw = iw_raw - padding;
+
+                                    const in_idx = b * in_ch * H * W + ic * H * W + ih * W + iw;
+                                    const w_idx = oc * in_ch * kH * kW + ic * kH * kW + kh * kW + kw;
+                                    sum += input[in_idx] * weight[w_idx];
+                                }
+                            }
+                        }
+                    }
+
+                    const out_idx = b * out_ch * out_H * out_W + oc * out_H * out_W + oh * out_W + ow;
+                    out[out_idx] = sum;
+                }
+            }
+        }
+    }
+}
+
+/// 2D convolution (im2col + matmul version for better performance)
+/// For larger kernels and channel counts
+pub fn conv2dFast(
+    allocator: std.mem.Allocator,
+    out: []f32,
+    input: []const f32,
+    weight: []const f32,
+    bias: ?[]const f32,
+    batch: usize,
+    in_ch: usize,
+    out_ch: usize,
+    H: usize,
+    W: usize,
+    kH: usize,
+    kW: usize,
+    stride: usize,
+    padding: usize,
+) !void {
+    const out_H = (H + 2 * padding - kH) / stride + 1;
+    const out_W = (W + 2 * padding - kW) / stride + 1;
+    const col_size = in_ch * kH * kW;
+    const spatial = out_H * out_W;
+
+    // Allocate im2col buffer
+    const col = try allocator.alloc(f32, col_size * spatial);
+    defer allocator.free(col);
+
+    for (0..batch) |b| {
+        // im2col: transform input patch to column
+        for (0..out_H) |oh| {
+            for (0..out_W) |ow| {
+                const col_idx = oh * out_W + ow;
+                for (0..in_ch) |ic| {
+                    for (0..kH) |kh| {
+                        for (0..kW) |kw| {
+                            const ih_raw = oh * stride + kh;
+                            const iw_raw = ow * stride + kw;
+                            const row = ic * kH * kW + kh * kW + kw;
+
+                            if (ih_raw >= padding and ih_raw < H + padding and
+                                iw_raw >= padding and iw_raw < W + padding)
+                            {
+                                const ih = ih_raw - padding;
+                                const iw = iw_raw - padding;
+                                const in_idx = b * in_ch * H * W + ic * H * W + ih * W + iw;
+                                col[row * spatial + col_idx] = input[in_idx];
+                            } else {
+                                col[row * spatial + col_idx] = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // matmul: out = weight @ col
+        // weight: [out_ch, col_size], col: [col_size, spatial]
+        const out_offset = b * out_ch * spatial;
+        matmul(out[out_offset..][0 .. out_ch * spatial], weight, col, out_ch, spatial, col_size);
+
+        // Add bias
+        if (bias) |bb| {
+            for (0..out_ch) |oc| {
+                const b_val = bb[oc];
+                for (0..spatial) |s| {
+                    out[out_offset + oc * spatial + s] += b_val;
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group Normalization
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Group Normalization
+/// input: [batch, channels, H, W]
+/// weight, bias: [channels]
+/// num_groups: must divide channels evenly
+pub fn groupNorm(
+    out: []f32,
+    input: []const f32,
+    weight: []const f32,
+    bias: []const f32,
+    batch: usize,
+    channels: usize,
+    H: usize,
+    W: usize,
+    num_groups: usize,
+    eps: f32,
+) void {
+    const channels_per_group = channels / num_groups;
+    const spatial = H * W;
+    const group_size = channels_per_group * spatial;
+
+    for (0..batch) |b| {
+        for (0..num_groups) |g| {
+            // Compute mean and variance for this group
+            var sum: f32 = 0;
+            var sum_sq: f32 = 0;
+
+            const group_start = g * channels_per_group;
+            for (0..channels_per_group) |c_off| {
+                const c = group_start + c_off;
+                for (0..spatial) |s| {
+                    const idx = b * channels * spatial + c * spatial + s;
+                    const val = input[idx];
+                    sum += val;
+                    sum_sq += val * val;
+                }
+            }
+
+            const mean = sum / @as(f32, @floatFromInt(group_size));
+            const variance = sum_sq / @as(f32, @floatFromInt(group_size)) - mean * mean;
+            const inv_std = 1.0 / @sqrt(variance + eps);
+
+            // Normalize and scale
+            for (0..channels_per_group) |c_off| {
+                const c = group_start + c_off;
+                const w = weight[c];
+                const bb = bias[c];
+                for (0..spatial) |s| {
+                    const idx = b * channels * spatial + c * spatial + s;
+                    out[idx] = (input[idx] - mean) * inv_std * w + bb;
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Upsampling
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Nearest neighbor 2x upsampling
+/// input: [batch, channels, H, W]
+/// out: [batch, channels, H*2, W*2]
+pub fn upsampleNearest2x(
+    out: []f32,
+    input: []const f32,
+    batch: usize,
+    channels: usize,
+    H: usize,
+    W: usize,
+) void {
+    const out_H = H * 2;
+    const out_W = W * 2;
+
+    for (0..batch) |b| {
+        for (0..channels) |c| {
+            for (0..out_H) |oh| {
+                const ih = oh / 2;
+                for (0..out_W) |ow| {
+                    const iw = ow / 2;
+                    const in_idx = b * channels * H * W + c * H * W + ih * W + iw;
+                    const out_idx = b * channels * out_H * out_W + c * out_H * out_W + oh * out_W + ow;
+                    out[out_idx] = input[in_idx];
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
