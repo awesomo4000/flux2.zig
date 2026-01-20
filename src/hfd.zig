@@ -69,6 +69,7 @@ pub fn main() !void {
         .dry_run = args.dry_run,
         .quiet = args.quiet,
         .verbose = args.verbose,
+        .update_interval_ms = args.update_interval_ms,
     });
     defer downloader.deinit();
 
@@ -86,6 +87,7 @@ pub const HfDownloader = struct {
     allocator: Allocator,
     config: Config,
     http_client: std.http.Client,
+    is_tty: bool,
 
     pub const Config = struct {
         repo_id: []const u8,
@@ -101,11 +103,16 @@ pub const HfDownloader = struct {
         // Parallel download settings
         parallel_chunks: usize = 4, // Number of parallel chunks per file
         parallel_threshold: usize = 5 * 1024 * 1024, // Min file size for parallel (5MB)
+        // Progress update interval in milliseconds (default: 100ms for TTY, 15s for non-TTY)
+        update_interval_ms: i64 = 0, // 0 means auto-detect based on TTY
     };
 
     const Self = @This();
 
     pub fn init(allocator: Allocator, config: Config) !Self {
+        // Detect if stdout is a TTY for progress display
+        const is_tty = std.posix.isatty(std.posix.STDOUT_FILENO);
+
         return Self{
             .allocator = allocator,
             .config = config,
@@ -116,7 +123,17 @@ pub const HfDownloader = struct {
                 .read_buffer_size = 32 * 1024, // 32k for reading
                 .write_buffer_size = 8 * 1024, // 8k for writing
             },
+            .is_tty = is_tty,
         };
+    }
+
+    /// Get the progress update interval in milliseconds
+    fn getUpdateInterval(self: *Self) i64 {
+        if (self.config.update_interval_ms > 0) {
+            return self.config.update_interval_ms;
+        }
+        // Auto-detect: 100ms for TTY, 15 seconds for non-TTY
+        return if (self.is_tty) 100 else 15000;
     }
 
     pub fn deinit(self: *Self) void {
@@ -270,10 +287,7 @@ pub const HfDownloader = struct {
         if (std.fs.cwd().statFile(out_path)) |stat| {
             if (stat.size == file.size) {
                 if (!self.config.quiet) {
-                    const skip_name = truncatePath(std.fs.path.basename(file.path), NAME_WIDTH);
-                    std.debug.print("{s}", .{skip_name});
-                    for (0..NAME_WIDTH - @min(skip_name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
-                    std.debug.print(" \x1b[90m- skip\x1b[0m\n", .{});
+                    self.printSkip(file.path);
                 }
                 return;
             }
@@ -364,8 +378,12 @@ pub const HfDownloader = struct {
     ) !void {
         // Build extra headers
         var headers_buf: [512]u8 = undefined;
-        var headers_list: [2]std.http.Header = undefined;
+        var headers_list: [3]std.http.Header = undefined;
         var header_count: usize = 0;
+
+        // Disable gzip encoding to avoid receiving compressed responses
+        headers_list[header_count] = .{ .name = "Accept-Encoding", .value = "identity" };
+        header_count += 1;
 
         // Auth header
         if (self.config.token) |token| {
@@ -449,9 +467,10 @@ pub const HfDownloader = struct {
             body_read += n;
             downloaded = start_offset + body_read;
 
-            // Update progress every 100ms
+            // Update progress at configured interval
             const now = std.time.milliTimestamp();
-            if (!self.config.quiet and (now - last_print > 100 or downloaded == total_size)) {
+            const update_interval = self.getUpdateInterval();
+            if (!self.config.quiet and (now - last_print > update_interval or downloaded == total_size)) {
                 self.printProgress(final_path, downloaded, total_size);
                 last_print = now;
             }
@@ -464,40 +483,45 @@ pub const HfDownloader = struct {
 
         // Final progress - show completion
         if (!self.config.quiet) {
-            var size_buf: [32]u8 = undefined;
-            const name = truncatePath(std.fs.path.basename(final_path), NAME_WIDTH);
-            std.debug.print("\r\x1b[K{s}", .{name});
-            for (0..NAME_WIDTH - @min(name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
-            std.debug.print(" \x1b[32m✓\x1b[0m {s}\n", .{formatSizeLocal(total_size, &size_buf)});
+            self.printCompletion(final_path, total_size);
         }
     }
 
     const NAME_WIDTH = 25; // Fixed width for filename column
 
     fn printProgress(self: *Self, path: []const u8, downloaded: usize, total: usize) void {
-        _ = self;
         const basename = std.fs.path.basename(path);
-        const pct: f64 = if (total > 0)
-            @as(f64, @floatFromInt(downloaded)) / @as(f64, @floatFromInt(total)) * 100
-        else
-            0;
+        const pct: usize = if (total > 0) (downloaded * 100) / total else 0;
 
         // Format sizes into separate buffers
         var tot_buf: [32]u8 = undefined;
         const tot_str = formatSizeLocal(total, &tot_buf);
 
-        // Format current with same width as total for stable display
         var dl_buf: [32]u8 = undefined;
-        const dl_raw = formatSizeLocal(downloaded, &dl_buf);
+        const dl_str = formatSizeLocal(downloaded, &dl_buf);
+
+        if (!self.is_tty) {
+            // Plain ASCII output for non-TTY (pipes, logs, etc.)
+            std.debug.print("{s}: {s}/{s} ({d}%)\n", .{ basename, dl_str, tot_str, pct });
+            return;
+        }
+
+        // TTY mode: fancy ANSI progress bar
+        const pct_f: f64 = if (total > 0)
+            @as(f64, @floatFromInt(downloaded)) / @as(f64, @floatFromInt(total)) * 100
+        else
+            0;
+
+        // Format current with same width as total for stable display
         var dl_padded: [32]u8 = undefined;
-        const pad_len = if (tot_str.len > dl_raw.len) tot_str.len - dl_raw.len else 0;
+        const pad_len = if (tot_str.len > dl_str.len) tot_str.len - dl_str.len else 0;
         for (0..pad_len) |i| dl_padded[i] = ' ';
-        @memcpy(dl_padded[pad_len..][0..dl_raw.len], dl_raw);
-        const dl_str = dl_padded[0 .. pad_len + dl_raw.len];
+        @memcpy(dl_padded[pad_len..][0..dl_str.len], dl_str);
+        const dl_padded_str = dl_padded[0 .. pad_len + dl_str.len];
 
         // Progress bar with fancy chars (yellow filled, gray empty)
         const bar_width = 24;
-        const filled = @as(usize, @intFromFloat(pct / 100.0 * @as(f64, @floatFromInt(bar_width))));
+        const filled = @as(usize, @intFromFloat(pct_f / 100.0 * @as(f64, @floatFromInt(bar_width))));
 
         // Pad filename to fixed width
         const name = truncatePath(basename, NAME_WIDTH);
@@ -510,7 +534,36 @@ pub const HfDownloader = struct {
         std.debug.print("\x1b[90m", .{});
         for (0..bar_width - filled) |_| std.debug.print("░", .{});
 
-        std.debug.print("\x1b[0m [ {s} / {s} ]", .{ dl_str, tot_str });
+        std.debug.print("\x1b[0m [ {s} / {s} ]", .{ dl_padded_str, tot_str });
+    }
+
+    fn printCompletion(self: *Self, path: []const u8, total_size: usize) void {
+        var size_buf: [32]u8 = undefined;
+        const name = truncatePath(std.fs.path.basename(path), NAME_WIDTH);
+
+        if (!self.is_tty) {
+            // Plain ASCII completion
+            std.debug.print("{s}: done ({s})\n", .{ name, formatSizeLocal(total_size, &size_buf) });
+            return;
+        }
+
+        // TTY: fancy completion with checkmark
+        std.debug.print("\r\x1b[K{s}", .{name});
+        for (0..NAME_WIDTH - @min(name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
+        std.debug.print(" \x1b[32m✓\x1b[0m {s}\n", .{formatSizeLocal(total_size, &size_buf)});
+    }
+
+    fn printSkip(self: *Self, path: []const u8) void {
+        const name = truncatePath(std.fs.path.basename(path), NAME_WIDTH);
+
+        if (!self.is_tty) {
+            std.debug.print("{s}: skip\n", .{name});
+            return;
+        }
+
+        std.debug.print("{s}", .{name});
+        for (0..NAME_WIDTH - @min(name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
+        std.debug.print(" \x1b[90m- skip\x1b[0m\n", .{});
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -579,6 +632,8 @@ pub const HfDownloader = struct {
 
         // Progress display loop
         const start_time = std.time.milliTimestamp();
+        var last_print = start_time;
+        const update_interval = self.getUpdateInterval();
         const bar_width: usize = 24;
         const segment_width = bar_width / actual_chunks;
 
@@ -598,45 +653,64 @@ pub const HfDownloader = struct {
             const current_mb = @as(f64, @floatFromInt(total_downloaded)) / (1024.0 * 1024.0);
             const speed_mbs = speed / (1024.0 * 1024.0);
 
-            // Build half-height progress bar: top=threads (fg), bottom=total (bg)
-            // Using ▀ with foreground=top color, background=bottom color
-            const name = truncatePath(std.fs.path.basename(final_path), NAME_WIDTH);
-            std.debug.print("\r\x1b[K{s}", .{name});
-            for (0..NAME_WIDTH - @min(name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
-            std.debug.print(" ", .{});
+            const now = std.time.milliTimestamp();
+            const should_print = (now - last_print > update_interval) or (total_downloaded >= total_size);
 
-            const total_filled = (pct * bar_width) / 100;
+            if (!self.config.quiet and should_print) {
+                last_print = now;
+                const name = truncatePath(std.fs.path.basename(final_path), NAME_WIDTH);
 
-            // Foreground colors for threads (bright)
-            const fg_colors = [_][]const u8{ "\x1b[93m", "\x1b[96m", "\x1b[95m", "\x1b[92m" }; // bright yellow, cyan, magenta, green
-            const fg_empty = "\x1b[90m"; // gray
-            // Background colors
-            const bg_white = "\x1b[47m"; // white background for total progress
-            const bg_dark = "\x1b[100m"; // dark gray background for empty
+                if (!self.is_tty) {
+                    // Plain ASCII output for non-TTY: name, progress, speed, ETA
+                    const remaining_mb = total_mb - current_mb;
+                    const eta_secs: u64 = if (speed_mbs > 0.01) @intFromFloat(remaining_mb / speed_mbs) else 0;
+                    const eta_min = eta_secs / 60;
+                    const eta_sec = eta_secs % 60;
+                    if (eta_secs > 0) {
+                        std.debug.print("{s}: {d:.1}/{d:.1} MB ({d}%) {d:.1} MB/s ETA {d}:{d:0>2}\n", .{ name, current_mb, total_mb, pct, speed_mbs, eta_min, eta_sec });
+                    } else {
+                        std.debug.print("{s}: {d:.1}/{d:.1} MB ({d}%) {d:.1} MB/s\n", .{ name, current_mb, total_mb, pct, speed_mbs });
+                    }
+                } else {
+                    // TTY: fancy colored progress bar
+                    std.debug.print("\r\x1b[K{s}", .{name});
+                    for (0..NAME_WIDTH - @min(name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
+                    std.debug.print(" ", .{});
 
-            for (0..actual_chunks) |chunk_i| {
-                const chunk_bytes = chunk_progress[chunk_i].load(.monotonic);
-                const chunk_total = contexts[chunk_i].chunk_size;
-                const chunk_pct = if (chunk_total > 0) (chunk_bytes * 100) / chunk_total else 0;
-                const thread_filled = (chunk_pct * segment_width) / 100;
-                const segment_start = chunk_i * segment_width;
+                    const total_filled = (pct * bar_width) / 100;
 
-                for (0..segment_width) |pos| {
-                    const global_pos = segment_start + pos;
-                    const has_thread = pos < thread_filled;
-                    const has_total = global_pos < total_filled;
+                    // Foreground colors for threads (bright)
+                    const fg_colors = [_][]const u8{ "\x1b[93m", "\x1b[96m", "\x1b[95m", "\x1b[92m" }; // bright yellow, cyan, magenta, green
+                    const fg_empty = "\x1b[90m"; // gray
+                    // Background colors
+                    const bg_white = "\x1b[47m"; // white background for total progress
+                    const bg_dark = "\x1b[100m"; // dark gray background for empty
 
-                    // Set foreground (top half) based on thread progress
-                    const fg = if (has_thread) fg_colors[chunk_i % 4] else fg_empty;
-                    // Set background (bottom half) based on total progress
-                    const bg = if (has_total) bg_white else bg_dark;
+                    for (0..actual_chunks) |chunk_i| {
+                        const chunk_bytes = chunk_progress[chunk_i].load(.monotonic);
+                        const chunk_total = contexts[chunk_i].chunk_size;
+                        const chunk_pct = if (chunk_total > 0) (chunk_bytes * 100) / chunk_total else 0;
+                        const thread_filled = (chunk_pct * segment_width) / 100;
+                        const segment_start = chunk_i * segment_width;
 
-                    std.debug.print("{s}{s}▀", .{ fg, bg });
+                        for (0..segment_width) |pos| {
+                            const global_pos = segment_start + pos;
+                            const has_thread = pos < thread_filled;
+                            const has_total = global_pos < total_filled;
+
+                            // Set foreground (top half) based on thread progress
+                            const fg = if (has_thread) fg_colors[chunk_i % 4] else fg_empty;
+                            // Set background (bottom half) based on total progress
+                            const bg = if (has_total) bg_white else bg_dark;
+
+                            std.debug.print("{s}{s}▀", .{ fg, bg });
+                        }
+                    }
+                    std.debug.print("\x1b[0m", .{}); // reset colors
+
+                    std.debug.print("\x1b[0m {d:>5.1}/{d:.1} MB {d:>2}% {d:.1} MB/s", .{ current_mb, total_mb, pct, speed_mbs });
                 }
             }
-            std.debug.print("\x1b[0m", .{}); // reset colors
-
-            std.debug.print("\x1b[0m {d:>5.1}/{d:.1} MB {d:>2}% {d:.1} MB/s", .{ current_mb, total_mb, pct, speed_mbs });
 
             if (total_downloaded >= total_size) break;
 
@@ -665,11 +739,9 @@ pub const HfDownloader = struct {
             }
         }
 
-        var size_buf: [32]u8 = undefined;
-        const final_name = truncatePath(std.fs.path.basename(final_path), NAME_WIDTH);
-        std.debug.print("\r\x1b[K{s}", .{final_name});
-        for (0..NAME_WIDTH - @min(final_name.len, NAME_WIDTH)) |_| std.debug.print(" ", .{});
-        std.debug.print(" \x1b[32m✓\x1b[0m {s}\n", .{formatSizeLocal(total_written, &size_buf)});
+        if (!self.config.quiet) {
+            self.printCompletion(final_path, total_written);
+        }
 
         if (had_error) {
             return error.ChunkDownloadFailed;
@@ -695,8 +767,12 @@ pub const HfDownloader = struct {
 
         // Build headers with Range
         var headers_buf: [512]u8 = undefined;
-        var headers_list: [2]std.http.Header = undefined;
+        var headers_list: [3]std.http.Header = undefined;
         var header_count: usize = 0;
+
+        // Disable gzip encoding
+        headers_list[header_count] = .{ .name = "Accept-Encoding", .value = "identity" };
+        header_count += 1;
 
         // Auth header
         if (ctx.token) |token| {
@@ -760,17 +836,26 @@ pub const HfDownloader = struct {
     }
 
     fn httpGet(self: *Self, url: []const u8) ![]u8 {
-        // Build extra headers for auth
-        var auth_header_buf: [256]u8 = undefined;
-        const extra_headers: []const std.http.Header = if (self.config.token) |token| blk: {
-            const auth_value = std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{token}) catch return error.TokenTooLong;
-            break :blk &.{.{ .name = "Authorization", .value = auth_value }};
-        } else &.{};
+        // Build extra headers
+        var headers_buf: [256]u8 = undefined;
+        var headers_list: [2]std.http.Header = undefined;
+        var header_count: usize = 0;
+
+        // Disable gzip encoding to avoid receiving compressed responses
+        headers_list[header_count] = .{ .name = "Accept-Encoding", .value = "identity" };
+        header_count += 1;
+
+        // Auth header
+        if (self.config.token) |token| {
+            const auth_value = std.fmt.bufPrint(&headers_buf, "Bearer {s}", .{token}) catch return error.TokenTooLong;
+            headers_list[header_count] = .{ .name = "Authorization", .value = auth_value };
+            header_count += 1;
+        }
 
         // Use request API for proper body reading
         const uri = try std.Uri.parse(url);
         var req = try self.http_client.request(.GET, uri, .{
-            .extra_headers = extra_headers,
+            .extra_headers = headers_list[0..header_count],
         });
         defer req.deinit();
 
@@ -867,6 +952,7 @@ const Args = struct {
     quiet: bool = false,
     verbose: bool = false,
     help: bool = false,
+    update_interval_ms: i64 = 0, // 0 = auto (100ms TTY, 15s non-TTY)
 
     fn parse(allocator: Allocator) !Args {
         var self = Args{
@@ -906,6 +992,19 @@ const Args = struct {
                 self.quiet = true;
             } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
                 self.verbose = true;
+            } else if (std.mem.eql(u8, arg, "--update-every")) {
+                if (args_iter.next()) |interval_str| {
+                    // Parse as milliseconds, or seconds if ends with 's'
+                    if (std.mem.endsWith(u8, interval_str, "s")) {
+                        const secs_str = interval_str[0 .. interval_str.len - 1];
+                        const secs = std.fmt.parseInt(i64, secs_str, 10) catch 15;
+                        self.update_interval_ms = secs * 1000;
+                    } else {
+                        // Assume seconds if small number, ms if large
+                        const val = std.fmt.parseInt(i64, interval_str, 10) catch 15000;
+                        self.update_interval_ms = if (val < 1000) val * 1000 else val;
+                    }
+                }
             } else if (!std.mem.startsWith(u8, arg, "-")) {
                 self.repo_id = arg;
             }
@@ -941,6 +1040,7 @@ fn printUsage() void {
         \\    --exclude PATTERN     Skip files matching glob pattern
         \\    --resume              Resume interrupted downloads
         \\    --dry-run             Show files without downloading
+        \\    --update-every SECS   Progress update interval (default: 0.1s TTY, 15s pipe)
         \\    -q, --quiet           Suppress progress output
         \\    -v, --verbose         Show detailed output
         \\    -h, --help            Show this help
