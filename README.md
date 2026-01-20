@@ -74,9 +74,11 @@ flux2.zig/
 
 ## Tools 🛠️
 
-### `hfd` — HuggingFace Downloader 📥
+### `hfd` — HuggingFace Downloader 📥🔥
 
 A pure Zig replacement for `pip install huggingface_hub && python download_model.py`: 🐍➡️🦎
+
+**TERMINAL-AWARE** 🖥️✨ — Detects TTY vs pipes automatically!
 
 ```bash
 # Download a model 📦
@@ -91,16 +93,23 @@ A pure Zig replacement for `pip install huggingface_hub && python download_model
 # Dry run - see what would be downloaded 👀
 ./zig-out/bin/hfd black-forest-labs/FLUX.2-klein-4B --dry-run
 
+# Control progress spam for CI/logs 🤫
+./zig-out/bin/hfd black-forest-labs/FLUX.2-klein-4B --update-every 30s
+
 # Gated models (requires token) 🔐
 export HF_TOKEN=hf_xxxxx
 ./zig-out/bin/hfd meta-llama/Llama-2-7b
 ```
 
-Features: ✨
+Features: ✨🚀💥
 - 🔒 SHA256 verification for LFS files
 - ⏸️ Resume interrupted downloads
 - 🎯 Include/exclude glob patterns
-- 📊 Progress bar with transfer stats
+- 📊 Multi-colored parallel progress bars (TTY) 🌈
+- 🖥️ **TTY-AWARE** — Fancy ANSI on terminals, clean ASCII for pipes/logs
+- ⏱️ **--update-every** — Control progress interval (auto: 100ms TTY, 15s pipes)
+- ⚡ **ETA calculations** — Know when your download finishes
+- 🗜️ **Gzip slayer** — No more corrupted JSON files from compressed responses
 
 ### `flux-server` — Memory-Resident Generation 🧠💾
 
